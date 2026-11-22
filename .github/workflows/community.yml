@@ -1,0 +1,58 @@
+name: NQAD Community
+on:
+  schedule:
+    - cron: "0 13 * * 1-5"    # pre-market levels (8:00 ET winter / 9:00 ET summer)
+    - cron: "25 13 * * 1-5"   # backup run if the first one is skipped (posts only once a day)
+    - cron: "15 21 * * 5"     # Trade of the Week, Friday after the US close
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "premarket or totw"
+        required: true
+        default: premarket
+        type: choice
+        options: [premarket, totw]
+      force:
+        description: "Post even if already posted today/this week"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: nqad-community
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      GUILD_ID: "1569290250289807381"
+      LEVELS_CHANNEL: "1569303588625195039"
+      LEVELS_ROLE: ""
+      TOTW_CHANNEL: "1574029314738094225"
+      TOTW_ROLE: "1574029310312976464"
+      TOTW_ANNOUNCE: "1569290251136925808"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run
+        run: |
+          EXTRA=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ inputs.mode }}"
+            if [ "${{ inputs.force }}" = "true" ]; then EXTRA="--force"; fi
+          elif [ "${{ github.event.schedule }}" = "15 21 * * 5" ]; then
+            MODE=totw
+          else
+            MODE=premarket
+          fi
+          python community.py "$MODE" $EXTRA
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "nqad-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add community_state.json
+          git diff --cached --quiet || (git commit -m "community state" && git pull --rebase -q && git push)
