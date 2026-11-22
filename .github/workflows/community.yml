@@ -1,17 +1,22 @@
 name: NQAD Community
 on:
   schedule:
-    - cron: "0 13 * * 1-5"    # pre-market levels (8:00 ET winter / 9:00 ET summer)
-    - cron: "25 13 * * 1-5"   # backup run if the first one is skipped (posts only once a day)
-    - cron: "15 21 * * 5"     # Trade of the Week, Friday after the US close
+    - cron: "30 3 * * 1-5"       # calendar: today's red-folder news (9:00 AM IST)
+    - cron: "0 13 * * 1-5"       # pre-market levels + poll
+    - cron: "25 13 * * 1-5"      # backup for levels (posts once a day)
+    - cron: "*/10 11-21 * * 1-5" # tick: news warnings, open countdown, payouts wall, news role
+    - cron: "0 */3 * * 0,6"      # weekend tick: payouts wall, news role
+    - cron: "15 21 * * 5"        # Trade of the Week winner
+    - cron: "30 14 * * 0"        # weekly outlook (Sunday 8:00 PM IST)
+    - cron: "30 4 * * 1"         # private weekly stats (Monday 10:00 AM IST)
   workflow_dispatch:
     inputs:
       mode:
-        description: "premarket or totw"
+        description: "What to run"
         required: true
         default: premarket
         type: choice
-        options: [premarket, totw]
+        options: [premarket, calendar, tick, countdown, weekly, stats, totw]
       force:
         description: "Post even if already posted today/this week"
         type: boolean
@@ -32,6 +37,15 @@ jobs:
       TOTW_CHANNEL: "1574029314738094225"
       TOTW_ROLE: "1574029310312976464"
       TOTW_ANNOUNCE: "1569290251136925808"
+      NEWS_CHANNEL: "1569303638441070592"
+      NEWS_ROLE: "1574032603860967554"
+      MEMBER_ROLE: "1569303484371566612"
+      COUNTDOWN_CHANNEL: "1569290251136925808"
+      PAYOUTS_CHANNEL: "1569303653678973091"
+      WALL_CHANNEL: "1574032601793036289"
+      FUNDED_ROLE: "1569303481444073515"
+      WEEKLY_CHANNEL: "1569303588625195039"
+      STATS_CHANNEL: "1569303742216667136"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,10 +57,15 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ inputs.mode }}"
             if [ "${{ inputs.force }}" = "true" ]; then EXTRA="--force"; fi
-          elif [ "${{ github.event.schedule }}" = "15 21 * * 5" ]; then
-            MODE=totw
           else
-            MODE=premarket
+            case "${{ github.event.schedule }}" in
+              "30 3 * * 1-5") MODE=calendar ;;
+              "*/10 11-21 * * 1-5"|"0 */3 * * 0,6") MODE=tick ;;
+              "15 21 * * 5") MODE=totw ;;
+              "30 14 * * 0") MODE=weekly ;;
+              "30 4 * * 1") MODE=stats ;;
+              *) MODE=premarket ;;
+            esac
           fi
           python community.py "$MODE" $EXTRA
       - name: Save state
