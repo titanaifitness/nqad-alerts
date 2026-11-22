@@ -273,10 +273,275 @@ def totw(d: Discord, guild: str, channel: str, role: str, announce: str | None,
     log.info("TOTW done: %s", best["author"]["username"] if best else "no votes")
 
 
+# ---------- economic calendar ----------
+IST = ZoneInfo("Asia/Kolkata")
+FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+
+def calendar(state: dict, max_age_min: int = 60) -> list[dict]:
+    """High-impact USD events this week, cached in state to respect the source's rate limits."""
+    now = dt.datetime.now(dt.timezone.utc)
+    cache = state.get("cal") or {}
+    fetched = cache.get("fetched")
+    if fetched and (now - dt.datetime.fromisoformat(fetched)).total_seconds() < max_age_min * 60:
+        return cache["events"]
+    req = urllib.request.Request(FF_URL, headers={"User-Agent": "Mozilla/5.0 (NQAD bot)"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+    except Exception as e:
+        if cache.get("events") is not None:
+            log.warning("Calendar fetch failed, using cache: %s", e)
+            return cache["events"]
+        raise
+    events = [{"title": e["title"], "date": e["date"], "forecast": e.get("forecast") or "",
+               "previous": e.get("previous") or ""}
+              for e in data if e.get("country") == "USD" and e.get("impact") == "High"]
+    state["cal"] = {"fetched": now.isoformat(), "events": events}
+    return events
+
+
+def ev_time(e: dict) -> dt.datetime:
+    return dt.datetime.fromisoformat(e["date"])
+
+
+def ev_line(e: dict) -> str:
+    t = ev_time(e)
+    extra = " · ".join(x for x in (f"F: {e['forecast']}" if e["forecast"] else "",
+                                  f"P: {e['previous']}" if e["previous"] else "") if x)
+    return (f"🔴 **{t.astimezone(IST).strftime('%I:%M %p')} IST** "
+            f"({t.astimezone(NY).strftime('%I:%M %p')} ET) · **{e['title']}**"
+            + (f"\n   ↳ {extra}" if extra else ""))
+
+
+def post_calendar(d: Discord, cfg: dict, state: dict, force: bool) -> None:
+    now = dt.datetime.now(NY)
+    key = now.date().isoformat()
+    if now.weekday() >= 5 and not force:
+        log.info("Weekend, no calendar")
+        return
+    if state.get("cal_last") == key and not force:
+        log.info("Calendar already posted today")
+        return
+    today = [e for e in calendar(state, 0) if ev_time(e).astimezone(NY).date() == now.date()]
+    today.sort(key=ev_time)
+    desc = ("\n".join(ev_line(e) for e in today) if today else
+            "✅ No high-impact USD news today. Cleaner tape, normal size.")
+    if today:
+        desc += "\n\n⚠️ Expect spikes and slippage around these times. Flat or small size into the release."
+    d.call(f"/channels/{cfg['NEWS_CHANNEL']}/messages", "POST", {"embeds": [{
+        "title": f"📰 Red-Folder News | {now.strftime('%a %d %b')}",
+        "description": desc + "\n\n*You'll get a ping 10 min before each release.*",
+        "color": COLOR, "footer": {"text": "USD high-impact only · source: ForexFactory"}}]})
+    state["cal_last"] = key
+    log.info("Calendar posted (%d events)", len(today))
+
+
+def news_warnings(d: Discord, cfg: dict, state: dict) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    warned = state.setdefault("warned", [])
+    role = cfg.get("NEWS_ROLE")
+    due = {}
+    for e in calendar(state):
+        mins = (ev_time(e) - now).total_seconds() / 60
+        key = e["date"] + "|" + e["title"]
+        if 0 < mins <= 20 and key not in warned:
+            due.setdefault(e["date"], []).append((e, key))
+    for date, items in sorted(due.items()):
+        mins = int((dt.datetime.fromisoformat(date) - now).total_seconds() // 60)
+        names = ", ".join(f"**{e['title']}**" for e, _ in items)
+        d.call(f"/channels/{cfg['NEWS_CHANNEL']}/messages", "POST", {
+            "content": (f"<@&{role}> " if role else "") +
+                       f"⚠️ {names} in **{mins} min** "
+                       f"({dt.datetime.fromisoformat(date).astimezone(IST).strftime('%I:%M %p')} IST). "
+                       "Careful with size, expect volatility.",
+            "allowed_mentions": {"roles": [role] if role else []}})
+        warned += [k for _, k in items]
+    state["warned"] = warned[-60:]
+
+
+# ---------- countdown ----------
+def countdown(d: Discord, cfg: dict, state: dict, force: bool = False) -> None:
+    now = dt.datetime.now(NY)
+    key = now.date().isoformat()
+    in_window = now.weekday() < 5 and dt.time(8, 45) <= now.time() < dt.time(9, 30)
+    if (not in_window or state.get("countdown_last") == key) and not force:
+        return
+    mins = max(1, int((dt.datetime.combine(now.date(), dt.time(9, 30), NY) - now).total_seconds() // 60))
+    news = [e for e in (state.get("cal") or {}).get("events", [])
+            if ev_time(e).astimezone(NY).date() == now.date()]
+    extra = f"\n📰 News today: " + ", ".join(e["title"] for e in news[:3]) if news else ""
+    d.call(f"/channels/{cfg['COUNTDOWN_CHANNEL']}/messages", "POST", {"embeds": [{
+        "title": f"🔔 NY opens in {mins} min",
+        "description": "Stream starting soon. Come trade the open with us 👇\n"
+                       f"📺 https://youtube.com/@nqafterdark/live{extra}",
+        "color": COLOR}]})
+    state["countdown_last"] = key
+    log.info("Countdown posted")
+
+
+# ---------- payouts wall ----------
+def payouts(d: Discord, cfg: dict, state: dict) -> None:
+    ch = cfg["PAYOUTS_CHANNEL"]
+    after = state.get("payouts_after")
+    q = f"?limit=50" + (f"&after={after}" if after else "")
+    msgs = sorted(d.call(f"/channels/{ch}/messages{q}") or [], key=lambda m: int(m["id"]))
+    for m in msgs:
+        state["payouts_after"] = m["id"]
+        imgs = [a for a in m.get("attachments", []) if (a.get("content_type") or "").startswith("image")]
+        if m["author"].get("bot") or not imgs:
+            continue
+        uid = m["author"]["id"]
+        try:
+            d.call(f"/guilds/{cfg['GUILD_ID']}/members/{uid}/roles/{cfg['FUNDED_ROLE']}", "PUT")
+        except RuntimeError as e:
+            log.warning("Funded role failed: %s", e)
+        link = f"https://discord.com/channels/{cfg['GUILD_ID']}/{ch}/{m['id']}"
+        note = (m.get("content") or "").strip()[:200]
+        d.call(f"/channels/{cfg['WALL_CHANNEL']}/messages", "POST", {
+            "content": f"🏆 <@{uid}> got paid!",
+            "embeds": [{"description": (note + "\n\n" if note else "") + f"[Original post]({link})",
+                        "image": {"url": imgs[0]["url"]}, "color": GOLD}],
+            "allowed_mentions": {"users": []}})
+        try:
+            d.call(f"/channels/{ch}/messages/{m['id']}/reactions/{urllib.parse.quote('🏆')}/@me", "PUT")
+        except RuntimeError:
+            pass
+        log.info("Payout walled for %s", m["author"]["username"])
+
+
+# ---------- news role for members ----------
+def sync_news_role(d: Discord, cfg: dict, state: dict) -> None:
+    role, mem = cfg.get("NEWS_ROLE"), cfg.get("MEMBER_ROLE")
+    if not role or not mem:
+        return
+    done = set(state.get("news_given", []))
+    after = "0"
+    while True:
+        page = d.call(f"/guilds/{cfg['GUILD_ID']}/members?limit=1000&after={after}") or []
+        for m in page:
+            uid = m["user"]["id"]
+            if m["user"].get("bot") or mem not in m["roles"] or uid in done:
+                continue
+            if role not in m["roles"]:
+                d.call(f"/guilds/{cfg['GUILD_ID']}/members/{uid}/roles/{role}", "PUT")
+            done.add(uid)
+        if len(page) < 1000:
+            break
+        after = page[-1]["user"]["id"]
+    state["news_given"] = sorted(done)
+
+
+# ---------- weekly outlook ----------
+def weekly(d: Discord, cfg: dict, state: dict, force: bool) -> None:
+    now = dt.datetime.now(NY)
+    week = now.strftime("%G-W%V")
+    if state.get("weekly_last") == week and not force:
+        log.info("Weekly already posted")
+        return
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?interval=1h&range=1mo"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=20) as r:
+        res = json.load(r)["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    bars = [(dt.datetime.fromtimestamp(t, NY), o, h, l, c, v or 0)
+            for t, o, h, l, c, v in zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"], q["volume"])
+            if None not in (o, h, l, c)]
+    # last completed trading week (Sunday 18:00 ET -> Friday 17:00 ET)
+    fri = now.date() - dt.timedelta(days=(now.weekday() - 4) % 7)
+    if now.weekday() == 4 and now.hour < 17:
+        fri -= dt.timedelta(days=7)
+    start = dt.datetime.combine(fri - dt.timedelta(days=5), dt.time(18, 0), NY)
+    end = dt.datetime.combine(fri, dt.time(17, 0), NY)
+    wk = [b for b in bars if start <= b[0] < end]
+    prev = [b for b in bars if start - dt.timedelta(days=7) <= b[0] < start]
+    if not wk:
+        raise RuntimeError("No bars for last week")
+    hi, lo, op, cl = max(b[2] for b in wk), min(b[3] for b in wk), wk[0][1], wk[-1][4]
+    chg = cl - (prev[-1][4] if prev else op)
+    vp = profile([(b[0], b[2], b[3], b[4], b[5]) for b in wk], step=25.0)
+    lines = [f"**Weekly high:** `{fmt(hi)}`", f"**Weekly low:** `{fmt(lo)}`",
+             f"**Range:** `{fmt(hi - lo)}` pts", f"**Close:** `{fmt(cl)}` ({'+' if chg >= 0 else ''}{chg:,.2f})"]
+    if vp:
+        lines += ["", f"**Weekly POC:** `{fmt(vp['poc'])}` · **VAH:** `{fmt(vp['vah'])}` · **VAL:** `{fmt(vp['val'])}`"]
+        if vp["lvn"]:
+            lines.append("**Weekly LVNs:** " + " · ".join(f"`{fmt(x - 12.5)}–{fmt(x + 12.5)}`" for x in vp["lvn"]))
+    events = sorted((e for e in calendar(state, 0) if ev_time(e) > dt.datetime.now(dt.timezone.utc)), key=ev_time)
+    if events:
+        lines += ["", "**📰 Big news this week**"]
+        for e in events[:10]:
+            t = ev_time(e)
+            lines.append(f"• {t.astimezone(IST).strftime('%a %I:%M %p')} IST · **{e['title']}**")
+    d.call(f"/channels/{cfg['WEEKLY_CHANNEL']}/messages", "POST", {"embeds": [{
+        "title": f"🗓️ NQ Weekly Outlook | week of {(fri + dt.timedelta(days=3)).strftime('%d %b')}",
+        "description": "\n".join(lines) + "\n\n*Approximate levels from hourly data. Not financial advice.*",
+        "color": COLOR, "footer": {"text": f"Last week: {start.strftime('%d %b')} – {fri.strftime('%d %b')}"}}]})
+    state["weekly_last"] = week
+    log.info("Weekly posted")
+
+
+# ---------- weekly stats (private) ----------
+def stats(d: Discord, cfg: dict, state: dict, force: bool) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    week = now.strftime("%G-W%V")
+    if state.get("stats_last") == week and not force:
+        return
+    g = d.call(f"/guilds/{cfg['GUILD_ID']}?with_counts=true")
+    members = g.get("approximate_member_count", 0)
+    prev = state.get("stats_members")
+    since = now - dt.timedelta(days=7)
+    counts, polls = {}, []
+    for c in d.call(f"/guilds/{cfg['GUILD_ID']}/channels"):
+        if c["type"] not in (0, 5) or c["id"] == cfg.get("STAFF_SKIP"):
+            continue
+        try:
+            msgs, before = [], None
+            for _ in range(5):
+                page = d.call(f"/channels/{c['id']}/messages?limit=100" + (f"&before={before}" if before else ""))
+                if not page:
+                    break
+                msgs += page
+                before = page[-1]["id"]
+                if snowflake_time(before) < since:
+                    break
+        except RuntimeError:
+            continue
+        for m in msgs:
+            if snowflake_time(m["id"]) < since:
+                continue
+            if m.get("poll"):
+                tot = sum(a.get("count", 0) for a in (m["poll"].get("results") or {}).get("answer_counts", []))
+                polls.append(tot)
+            if not m["author"].get("bot"):
+                n = m["author"].get("global_name") or m["author"]["username"]
+                counts[n] = counts.get(n, 0) + 1
+    top = sorted(counts.items(), key=lambda x: -x[1])[:5]
+    lines = [f"**Members:** {members}" + (f" ({'+' if members - prev >= 0 else ''}{members - prev} this week)" if prev is not None else ""),
+             f"**Messages (7d):** {sum(counts.values())}",
+             f"**Poll votes (7d):** {sum(polls)} across {len(polls)} polls"]
+    if top:
+        lines += ["", "**Most active**"] + [f"{i}. {n}: {c}" for i, (n, c) in enumerate(top, 1)]
+    d.call(f"/channels/{cfg['STATS_CHANNEL']}/messages", "POST", {"embeds": [{
+        "title": f"📊 Weekly Server Stats | {now.strftime('%d %b')}", "description": "\n".join(lines),
+        "color": COLOR, "footer": {"text": "Private to staff · use these numbers in firm pitches"}}]})
+    state["stats_last"], state["stats_members"] = week, members
+    log.info("Stats posted")
+
+
+def tick(d: Discord, cfg: dict, state: dict) -> None:
+    for name, fn in (("news", lambda: news_warnings(d, cfg, state)),
+                     ("countdown", lambda: countdown(d, cfg, state)),
+                     ("payouts", lambda: payouts(d, cfg, state)),
+                     ("newsrole", lambda: sync_news_role(d, cfg, state))):
+        try:
+            fn()
+        except Exception as e:
+            log.error("tick/%s failed: %s", name, e)
+
+
 # ---------- main ----------
 def main() -> int:
     p = argparse.ArgumentParser(description="NQAD community automations")
-    p.add_argument("mode", choices=["premarket", "totw", "auto"])
+    p.add_argument("mode", choices=["premarket", "totw", "calendar", "tick", "weekly", "stats", "countdown", "auto"])
     p.add_argument("--force", action="store_true", help="ignore day/week guards")
     p.add_argument("--dry-run", action="store_true", help="log instead of posting")
     p.add_argument("--debug", action="store_true")
@@ -288,7 +553,9 @@ def main() -> int:
         log.error("DISCORD_TOKEN secret is missing")
         return 1
     cfg = {k: os.getenv(k, "").strip() for k in
-           ("GUILD_ID", "LEVELS_CHANNEL", "LEVELS_ROLE", "TOTW_CHANNEL", "TOTW_ROLE", "TOTW_ANNOUNCE")}
+           ("GUILD_ID", "LEVELS_CHANNEL", "LEVELS_ROLE", "TOTW_CHANNEL", "TOTW_ROLE", "TOTW_ANNOUNCE",
+            "NEWS_CHANNEL", "NEWS_ROLE", "MEMBER_ROLE", "COUNTDOWN_CHANNEL", "PAYOUTS_CHANNEL",
+            "WALL_CHANNEL", "FUNDED_ROLE", "WEEKLY_CHANNEL", "STATS_CHANNEL")}
     d = Discord(token, a.dry_run)
     state = load_state()
     mode = a.mode
@@ -297,6 +564,16 @@ def main() -> int:
     try:
         if mode == "premarket":
             premarket(d, cfg["LEVELS_CHANNEL"], cfg["LEVELS_ROLE"] or None, state, a.force)
+        elif mode == "calendar":
+            post_calendar(d, cfg, state, a.force)
+        elif mode == "tick":
+            tick(d, cfg, state)
+        elif mode == "weekly":
+            weekly(d, cfg, state, a.force)
+        elif mode == "stats":
+            stats(d, cfg, state, a.force)
+        elif mode == "countdown":
+            countdown(d, cfg, state, a.force)
         else:
             totw(d, cfg["GUILD_ID"], cfg["TOTW_CHANNEL"], cfg["TOTW_ROLE"],
                  cfg["TOTW_ANNOUNCE"] or None, state, a.force)
@@ -310,6 +587,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-def a():
-    if x:
-        return 1
