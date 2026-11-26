@@ -67,6 +67,32 @@ class Discord:
                 raise RuntimeError(f"{method} {path} -> {e.code}: {e.read()[:200]!r}") from e
         raise RuntimeError(f"{method} {path} failed after retries")
 
+    def upload(self, path: str, payload: dict, files: list[tuple[str, bytes, str]]):
+        if self.dry:
+            log.info("[dry] UPLOAD %s %d files", path, len(files))
+            return {"id": "dry"}
+        b = "----nqad" + str(int(time.time() * 1000))
+        body = (f"--{b}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+                f"Content-Type: application/json\r\n\r\n{json.dumps(payload)}\r\n").encode()
+        for i, (name, data, ctype) in enumerate(files):
+            body += (f"--{b}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{name}\"\r\n"
+                     f"Content-Type: {ctype}\r\n\r\n").encode() + data + b"\r\n"
+        body += f"--{b}--\r\n".encode()
+        req = urllib.request.Request(API + path, data=body, method="POST", headers={
+            "Authorization": f"Bot {self.token}", "Content-Type": f"multipart/form-data; boundary={b}",
+            "User-Agent": "DiscordBot (nqad-community, 1.0)"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+
+    def dm(self, uid: str, content: str) -> bool:
+        try:
+            ch = self.call("/users/@me/channels", "POST", {"recipient_id": uid})
+            self.call(f"/channels/{ch['id']}/messages", "POST", {"content": content})
+            return True
+        except Exception as e:
+            log.warning("DM to %s failed: %s", uid, e)
+            return False
+
 
 def fetch_bars() -> list[tuple[dt.datetime, float, float, float, float]]:
     url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?interval=5m&range=5d"
@@ -527,11 +553,83 @@ def stats(d: Discord, cfg: dict, state: dict, force: bool) -> None:
     log.info("Stats posted")
 
 
+# ---------- tool access claims ----------
+def claims(d: Discord, cfg: dict, state: dict) -> None:
+    ch, req = cfg["CLAIM_CHANNEL"], cfg["REQUESTS_CHANNEL"]
+    if not ch or not req:
+        return
+    after = state.get("claim_after")
+    msgs = d.call(f"/channels/{ch}/messages?limit=50" + (f"&after={after}" if after else "")) or []
+    pending = state.setdefault("pending", {})
+    for m in sorted(msgs, key=lambda m: int(m["id"])):
+        state["claim_after"] = m["id"]
+        if m["author"].get("bot"):
+            continue
+        uid, name = m["author"]["id"], m["author"].get("global_name") or m["author"]["username"]
+        files = []
+        for a in m.get("attachments", [])[:4]:
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(a["url"], headers={"User-Agent": "Mozilla/5.0"}), timeout=30)
+                files.append((a["filename"], r.read(), a.get("content_type") or "application/octet-stream"))
+            except Exception as e:
+                log.warning("Attachment download failed: %s", e)
+        if not files:
+            d.call(f"/channels/{ch}/messages/{m['id']}", "DELETE")
+            d.dm(uid, "Hi! To unlock the NQ After Dark tools, please upload a **screenshot** of your order "
+                      "(order ID, date and code NAD) in #claim-access.")
+            continue
+        note = (m.get("content") or "").strip()[:500]
+        posted = d.upload(f"/channels/{req}/messages", {
+            "content": f"📩 **Claim** from <@{uid}> ({name}) · `{uid}`" + (f"\n> {note}" if note else "")
+                       + "\nReact ✅ approve · ❌ reject",
+            "allowed_mentions": {"parse": []}}, files)
+        for e in ("✅", "❌"):
+            d.call(f"/channels/{req}/messages/{posted['id']}/reactions/{urllib.parse.quote(e)}/@me", "PUT")
+            time.sleep(0.4)
+        pending[posted["id"]] = uid
+        d.call(f"/channels/{ch}/messages/{m['id']}", "DELETE")
+        d.dm(uid, "📩 Got your claim for NQ After Dark tools! Staff will verify it soon (usually within 24h). "
+                  "You'll get a DM here when it's done.")
+        log.info("Claim moved for %s", name)
+
+
+def reviews(d: Discord, cfg: dict, state: dict) -> None:
+    req, role, guild = cfg["REQUESTS_CHANNEL"], cfg["ACCESS_ROLE"], cfg["GUILD_ID"]
+    pending = state.get("pending", {})
+    for mid, uid in list(pending.items()):
+        try:
+            votes = {}
+            for e in ("✅", "❌"):
+                users = d.call(f"/channels/{req}/messages/{mid}/reactions/{urllib.parse.quote(e)}?limit=10") or []
+                votes[e] = [u for u in users if not u.get("bot")]
+        except RuntimeError as e:
+            if "404" in str(e):
+                pending.pop(mid, None)
+            continue
+        if votes["✅"]:
+            d.call(f"/guilds/{guild}/members/{uid}/roles/{role}", "PUT")
+            d.dm(uid, "✅ You're verified! **Tools Access** is unlocked in NQ After Dark: check "
+                      "#atas-algo, #atas-indicators and #tradingview-indicators. Need help? Ask in #setup-help.")
+            d.call(f"/channels/{req}/messages", "POST", {"content": f"✅ Approved <@{uid}> (by {votes['✅'][0]['username']})",
+                                                          "allowed_mentions": {"parse": []},
+                                                          "message_reference": {"message_id": mid}})
+            pending.pop(mid)
+        elif votes["❌"]:
+            d.dm(uid, "❌ Sorry, we couldn't verify that order with code NAD. If you think this is a mistake, "
+                      "post a clearer screenshot (order ID, date, code) in #claim-access.")
+            d.call(f"/channels/{req}/messages", "POST", {"content": f"❌ Rejected <@{uid}> (by {votes['❌'][0]['username']})",
+                                                          "allowed_mentions": {"parse": []},
+                                                          "message_reference": {"message_id": mid}})
+            pending.pop(mid)
+
+
 def tick(d: Discord, cfg: dict, state: dict) -> None:
     for name, fn in (("news", lambda: news_warnings(d, cfg, state)),
                      ("countdown", lambda: countdown(d, cfg, state)),
                      ("payouts", lambda: payouts(d, cfg, state)),
-                     ("newsrole", lambda: sync_news_role(d, cfg, state))):
+                     ("newsrole", lambda: sync_news_role(d, cfg, state)),
+                     ("claims", lambda: claims(d, cfg, state)),
+                     ("reviews", lambda: reviews(d, cfg, state))):
         try:
             fn()
         except Exception as e:
@@ -555,7 +653,8 @@ def main() -> int:
     cfg = {k: os.getenv(k, "").strip() for k in
            ("GUILD_ID", "LEVELS_CHANNEL", "LEVELS_ROLE", "TOTW_CHANNEL", "TOTW_ROLE", "TOTW_ANNOUNCE",
             "NEWS_CHANNEL", "NEWS_ROLE", "MEMBER_ROLE", "COUNTDOWN_CHANNEL", "PAYOUTS_CHANNEL",
-            "WALL_CHANNEL", "FUNDED_ROLE", "WEEKLY_CHANNEL", "STATS_CHANNEL")}
+            "WALL_CHANNEL", "FUNDED_ROLE", "WEEKLY_CHANNEL", "STATS_CHANNEL",
+            "CLAIM_CHANNEL", "REQUESTS_CHANNEL", "ACCESS_ROLE")}
     d = Discord(token, a.dry_run)
     state = load_state()
     mode = a.mode
