@@ -4,8 +4,7 @@ on:
     - cron: "30 3 * * 1-5"       # calendar: today's red-folder news (9:00 AM IST)
     - cron: "0 13 * * 1-5"       # pre-market levels + poll
     - cron: "25 13 * * 1-5"      # backup for levels (posts once a day)
-    - cron: "*/10 11-21 * * 1-5" # tick: news warnings, open countdown, payouts wall, news role
-    - cron: "0 */3 * * 0,6"      # weekend tick: payouts wall, news role
+    - cron: "*/10 * * * *"       # tick: news warnings, countdown, payouts wall, news role, tool claims
     - cron: "15 21 * * 5"        # Trade of the Week winner
     - cron: "30 14 * * 0"        # weekly outlook (Sunday 8:00 PM IST)
     - cron: "30 4 * * 1"         # private weekly stats (Monday 10:00 AM IST)
@@ -46,6 +45,9 @@ jobs:
       FUNDED_ROLE: "1569303481444073515"
       WEEKLY_CHANNEL: "1569303588625195039"
       STATS_CHANNEL: "1569303742216667136"
+      CLAIM_CHANNEL: "1575544643255406723"
+      REQUESTS_CHANNEL: "1575544665841598609"
+      ACCESS_ROLE: "1575544567627780254"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -60,7 +62,7 @@ jobs:
           else
             case "${{ github.event.schedule }}" in
               "30 3 * * 1-5") MODE=calendar ;;
-              "*/10 11-21 * * 1-5"|"0 */3 * * 0,6") MODE=tick ;;
+              "*/10 * * * *") MODE=tick ;;
               "15 21 * * 5") MODE=totw ;;
               "30 14 * * 0") MODE=weekly ;;
               "30 4 * * 1") MODE=stats ;;
