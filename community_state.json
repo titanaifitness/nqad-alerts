@@ -1,7 +1,7 @@
 {
   "premarket_last": "2026-11-26",
   "cal": {
-    "fetched": "2026-11-27T09:10:17.554172+00:00",
+    "fetched": "2026-11-27T12:56:44.182975+00:00",
     "events": [
       {
         "title": "Core PCE Price Index m/m",
@@ -28,7 +28,7 @@
     "464860820854276126",
     "762093611365302342"
   ],
-  "cal_last": "2026-11-24",
+  "cal_last": "2026-11-27",
   "stats_last": "2026-W48",
   "stats_members": 9,
   "pending": {},
